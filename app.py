@@ -181,33 +181,72 @@ def montar_base():
     atl["adversario_abrev"] = atl.adversario.map(clubes)
     atl["adversario_escudo"] = atl.adversario.map(escudos)
     atl["posicao"] = atl.posicao_id.map(POS)
+
+    if not h.empty:
+        ultimos_map = (h.sort_values("rodada").groupby("atleta_id")["pontos"]
+                        .apply(lambda s: [round(float(v), 1) for v in s.tail(5)]).to_dict())
+    else:
+        ultimos_map = {}
+    atl["hist_pontos"] = atl["atleta_id"].map(ultimos_map)
+    atl["hist_pontos"] = atl["hist_pontos"].apply(lambda v: v if isinstance(v, list) else [])
     return atl, rodada, aberto, validacao, mando
 
 
-def cartao_jogador(row, largura_foto=76):
-    """HTML compacto com foto do jogador, escudo do clube e os números principais."""
-    cap_badge = " 🅲" if bool(row.get("capitao", False)) else ""
+def cartao_jogador(row, largura=148):
+    """Card estilo 'carta de jogador' (dourado), com foto, posição, preço, previsão e histórico recente."""
+    cap_badge = ' <span style="color:#8a0000;">🅲</span>' if bool(row.get("capitao", False)) else ""
     foto = row.get("foto_url")
     escudo = row.get("clube_escudo")
-    foto_html = (f'<img src="{foto}" width="{largura_foto}" '
-                 f'style="border-radius:10px;object-fit:cover;">' if foto else
-                 f'<div style="width:{largura_foto}px;height:{largura_foto}px;border-radius:10px;'
-                 f'background:#eee;display:flex;align-items:center;justify-content:center;'
-                 f'font-size:26px;">👤</div>')
-    escudo_html = f'<img src="{escudo}" width="16" style="vertical-align:middle;margin-right:3px;">' if escudo else ""
+    hist = row.get("hist_pontos") or []
+
+    foto_html = (
+        f'<img src="{foto}" style="width:64px;height:64px;border-radius:50%;object-fit:cover;'
+        f'border:3px solid #4a2f0a;box-shadow:0 2px 6px rgba(0,0,0,.4);">' if foto else
+        '<div style="width:64px;height:64px;border-radius:50%;background:#3a2a12;'
+        'display:flex;align-items:center;justify-content:center;font-size:26px;'
+        'border:3px solid #4a2f0a;">👤</div>'
+    )
+    escudo_html = f'<img src="{escudo}" width="18" style="margin-top:-6px;">' if escudo else ""
+
+    barras = ""
+    if hist:
+        maior = max(3.0, max(abs(v) for v in hist))
+        for v in hist:
+            altura = max(4, int(abs(v) / maior * 22))
+            cor = "#1b8a3a" if v >= 0 else "#b3261e"
+            barras += (f'<div title="{v:.1f} pts" style="width:6px;height:{altura}px;'
+                       f'background:{cor};border-radius:2px;"></div>')
+        hist_html = (f'<div style="display:flex;gap:3px;justify-content:center;'
+                     f'align-items:flex-end;height:24px;margin-top:6px;">{barras}</div>'
+                     f'<div style="font-size:9px;color:#5a3c0a;margin-top:1px;">últimos {len(hist)} jogos</div>')
+    else:
+        hist_html = '<div style="font-size:10px;color:#5a3c0a;margin-top:6px;">sem histórico ainda</div>'
+
     st.markdown(
         f"""
-        <div style="text-align:center;margin-bottom:10px;">
-            {foto_html}
-            <div style="margin-top:4px;font-weight:600;font-size:13px;line-height:1.2;">
-                {row.apelido}{cap_badge}
+        <div style="
+            width:{largura}px;margin:0 auto 14px auto;border-radius:16px;
+            background:linear-gradient(160deg,#f7dd8f 0%,#e8b93f 42%,#b8790a 100%);
+            border:2px solid #7a4e0a;box-shadow:0 6px 16px rgba(0,0,0,.5);
+            padding:10px 8px 12px 8px;text-align:center;color:#2b1900;">
+            <div style="display:flex;justify-content:space-between;align-items:center;font-weight:800;">
+                <span style="background:#2b1900;color:#f7dd8f;border-radius:6px;
+                             padding:1px 6px;font-size:11px;">{row.posicao}</span>
+                <span style="font-size:20px;">{row.pred:.0f}{cap_badge}</span>
             </div>
-            <div style="font-size:11px;color:#888;">
-                {escudo_html}{row.clube_abrev} x {row.adversario_abrev} · {"casa" if row.casa else "fora"}
+            <div style="margin-top:2px;">{foto_html}</div>
+            <div style="font-weight:700;font-size:12px;text-transform:uppercase;
+                        margin-top:3px;line-height:1.15;">{row.apelido}</div>
+            <div style="margin-top:1px;">{escudo_html}
+                <div style="font-size:10px;color:#4a2f0a;">x {row.adversario_abrev} ·
+                {"casa" if row.casa else "fora"}</div>
             </div>
-            <div style="font-size:12px;margin-top:2px;">
-                💰 C$ {row.preco_num:.2f} &nbsp;·&nbsp; 📈 {row.pred:.2f} pts
+            <div style="display:flex;justify-content:space-around;margin-top:5px;
+                        font-size:11px;font-weight:700;border-top:1px solid #7a4e0a;padding-top:5px;">
+                <span title="Preço na rodada">💰 C$ {row.preco_num:.1f}</span>
+                <span title="Previsão do modelo">📈 {row.pred:.1f} pts</span>
             </div>
+            {hist_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -216,7 +255,21 @@ def cartao_jogador(row, largura_foto=76):
 
 # ============================== INTERFACE ==============================
 st.set_page_config(page_title="Agente Cartola", page_icon="⚽", layout="wide")
-st.title("⚽ Agente Cartola FC")
+st.markdown(
+    """
+    <div style="
+        background: repeating-linear-gradient(90deg, #1c3d24 0px, #1c3d24 40px,
+                    #204826 40px, #204826 80px);
+        border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
+        border: 1px solid #3a5c3f;">
+        <h1 style="margin:0;color:#f0f2f0;">⚽ Agente Cartola FC</h1>
+        <p style="margin:2px 0 0 0;color:#c8d6c9;font-size:13px;">
+            Escalação automática e montagem manual com modelo preditivo
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Configuração")
@@ -359,7 +412,7 @@ with tab_manual:
                 if escolha_id is not None:
                     linha = lookup[escolha_id]
                     escolhidos.append(linha)
-                    cartao_jogador(linha, largura_foto=56)
+                    cartao_jogador(linha, largura=140)
 
     st.divider()
     if escolhidos:
