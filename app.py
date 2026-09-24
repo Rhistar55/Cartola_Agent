@@ -183,8 +183,14 @@ def montar_base():
     atl["posicao"] = atl.posicao_id.map(POS)
 
     if not h.empty:
-        ultimos_map = (h.sort_values("rodada").groupby("atleta_id")["pontos"]
-                        .apply(lambda s: [round(float(v), 1) for v in s.tail(5)]).to_dict())
+        def _ultimos5(grupo):
+            recentes = grupo.sort_values("rodada").tail(5)
+            return [
+                {"rodada": int(r.rodada), "pontos": round(float(r.pontos), 1),
+                 "adversario_abrev": clubes.get(int(r.adversario), "?")}
+                for r in recentes.itertuples()
+            ]
+        ultimos_map = h.groupby("atleta_id").apply(_ultimos5).to_dict()
     else:
         ultimos_map = {}
     atl["hist_pontos"] = atl["atleta_id"].map(ultimos_map)
@@ -193,10 +199,11 @@ def montar_base():
 
 
 def cartao_jogador(row, largura=148):
-    """Card estilo 'carta de jogador' (dourado), com foto, posição, preço, previsão e histórico recente."""
+    """Card estilo 'carta de jogador' (dourado), com foto, preço, previsão e histórico recente."""
     cap_badge = ' <span style="color:#8a0000;">🅲</span>' if bool(row.get("capitao", False)) else ""
     foto = row.get("foto_url")
     escudo = row.get("clube_escudo")
+    adv_escudo = row.get("adversario_escudo")
     hist = row.get("hist_pontos") or []
 
     foto_html = (
@@ -206,40 +213,57 @@ def cartao_jogador(row, largura=148):
         'display:flex;align-items:center;justify-content:center;font-size:26px;'
         'border:3px solid #4a2f0a;">👤</div>'
     )
-    escudo_html = f'<img src="{escudo}" width="18" style="margin-top:-6px;">' if escudo else ""
+    escudo_html = f'<img src="{escudo}" width="24" style="vertical-align:middle;">' if escudo else ""
+    adv_escudo_html = (f'<img src="{adv_escudo}" width="16" style="vertical-align:middle;margin-right:3px;">'
+                        if adv_escudo else "")
 
-    barras = ""
     if hist:
-        maior = max(3.0, max(abs(v) for v in hist))
-        for v in hist:
-            altura = max(4, int(abs(v) / maior * 22))
-            cor = "#1b8a3a" if v >= 0 else "#b3261e"
-            barras += (f'<div title="{v:.1f} pts" style="width:6px;height:{altura}px;'
-                       f'background:{cor};border-radius:2px;"></div>')
-        hist_html = (f'<div style="display:flex;gap:3px;justify-content:center;'
-                     f'align-items:flex-end;height:24px;margin-top:6px;">{barras}</div>'
-                     f'<div style="font-size:9px;color:#5a3c0a;margin-top:1px;">últimos {len(hist)} jogos</div>')
+        maior = max(3.0, max(abs(j["pontos"]) for j in hist))
+        barras = "".join(
+            f'<div style="width:8px;height:{max(4, int(abs(j["pontos"]) / maior * 22))}px;'
+            f'background:{"#1b8a3a" if j["pontos"] >= 0 else "#b3261e"};border-radius:2px;"></div>'
+            for j in hist
+        )
+        linhas_tooltip = "".join(
+            f'<div style="display:flex;justify-content:space-between;gap:10px;padding:3px 0;'
+            f'border-bottom:1px solid #3a2a12;"><span>R{j["rodada"]} · x {j["adversario_abrev"]}</span>'
+            f'<span style="font-weight:700;color:{"#7ddc8c" if j["pontos"] >= 0 else "#ff8a80"};">'
+            f'{j["pontos"]:.1f}</span></div>'
+            for j in reversed(hist)
+        )
+        hist_html = f"""
+            <div class="mini-hist">
+                <div style="display:flex;gap:3px;justify-content:center;align-items:flex-end;
+                            height:24px;margin-top:6px;">{barras}</div>
+                <div style="font-size:9px;color:#5a3c0a;margin-top:1px;">últimos {len(hist)} jogos ⓘ</div>
+                <div class="mini-tooltip">
+                    <div style="font-weight:700;margin-bottom:4px;text-align:center;">
+                        Últimos {len(hist)} jogos</div>
+                    {linhas_tooltip}
+                </div>
+            </div>
+        """
     else:
         hist_html = '<div style="font-size:10px;color:#5a3c0a;margin-top:6px;">sem histórico ainda</div>'
 
     st.markdown(
         f"""
         <div style="
-            width:{largura}px;margin:0 auto 14px auto;border-radius:16px;
+            width:{largura}px;margin:0 auto 6px auto;border-radius:14px;
             background:linear-gradient(160deg,#f7dd8f 0%,#e8b93f 42%,#b8790a 100%);
             border:2px solid #7a4e0a;box-shadow:0 6px 16px rgba(0,0,0,.5);
-            padding:10px 8px 12px 8px;text-align:center;color:#2b1900;">
-            <div style="display:flex;justify-content:space-between;align-items:center;font-weight:800;">
+            padding:8px 6px 8px 6px;text-align:center;color:#2b1900;">
+            <div style="font-weight:800;">
                 <span style="background:#2b1900;color:#f7dd8f;border-radius:6px;
                              padding:1px 6px;font-size:11px;">{row.posicao}</span>
-                <span style="font-size:20px;">{row.pred:.0f}{cap_badge}</span>
             </div>
             <div style="margin-top:2px;">{foto_html}</div>
             <div style="font-weight:700;font-size:12px;text-transform:uppercase;
-                        margin-top:3px;line-height:1.15;">{row.apelido}</div>
-            <div style="margin-top:1px;">{escudo_html}
-                <div style="font-size:10px;color:#4a2f0a;">x {row.adversario_abrev} ·
-                {"casa" if row.casa else "fora"}</div>
+                        margin-top:3px;line-height:1.15;">
+                {escudo_html} {row.apelido}{cap_badge}
+            </div>
+            <div style="font-size:11px;color:#4a2f0a;margin-top:2px;">
+                {adv_escudo_html}x {row.adversario_abrev} ({"casa" if row.casa else "fora"})
             </div>
             <div style="display:flex;justify-content:space-around;margin-top:5px;
                         font-size:11px;font-weight:700;border-top:1px solid #7a4e0a;padding-top:5px;">
@@ -250,11 +274,31 @@ def cartao_jogador(row, largura=148):
         </div>
         """,
         unsafe_allow_html=True,
+
     )
 
 
 # ============================== INTERFACE ==============================
 st.set_page_config(page_title="Agente Cartola", page_icon="⚽", layout="wide")
+st.markdown(
+    """
+    <style>
+    [data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
+    [data-testid="stVerticalBlockBorderWrapper"] { gap: 0.3rem !important; }
+    .mini-hist { position: relative; display: inline-block; cursor: help; }
+    .mini-hist .mini-tooltip {
+        visibility: hidden; opacity: 0; transition: opacity .15s ease;
+        position: absolute; bottom: 115%; left: 50%; transform: translateX(-50%);
+        background: #1b120a; color: #f7dd8f; border: 1px solid #7a4e0a; border-radius: 10px;
+        padding: 10px 12px; width: 210px; z-index: 999;
+        box-shadow: 0 10px 24px rgba(0,0,0,.6); text-align: left; font-size: 11px;
+        pointer-events: none;
+    }
+    .mini-hist:hover .mini-tooltip { visibility: visible; opacity: 1; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.markdown(
     """
     <div style="
@@ -334,13 +378,19 @@ with tab_auto:
     pos_filtro = st.multiselect("Filtrar posição", options=list(POS.values()),
                                  default=list(POS.values()), key="filtro_auto")
     tabela = atl_disp[atl_disp.posicao.isin(pos_filtro)][
-        ["apelido", "posicao", "clube_abrev", "adversario_abrev", "casa", "preco_num", "media_num", "pred"]
+        ["clube_escudo", "apelido", "posicao", "adversario_escudo", "casa", "preco_num", "media_num", "pred"]
     ].rename(columns={
-        "apelido": "Jogador", "posicao": "Pos", "clube_abrev": "Clube", "adversario_abrev": "Adversário",
+        "clube_escudo": "Time", "apelido": "Jogador", "posicao": "Pos", "adversario_escudo": "Contra",
         "casa": "Mando", "preco_num": "Preço", "media_num": "Média Cartola", "pred": "Previsão (modelo)",
     }).sort_values("Previsão (modelo)", ascending=False)
     tabela["Mando"] = tabela["Mando"].map({1: "Casa", 0: "Fora"})
-    st.dataframe(tabela, use_container_width=True, hide_index=True)
+    st.dataframe(
+        tabela, use_container_width=True, hide_index=True,
+        column_config={
+            "Time": st.column_config.ImageColumn("Time", width="small"),
+            "Contra": st.column_config.ImageColumn("Contra", width="small"),
+        },
+    )
 
 # ============================== ABA 2 — MANUAL ==============================
 with tab_manual:
@@ -428,10 +478,16 @@ with tab_manual:
         st.caption("O resumo lá em cima já considera o capitão escolhido.")
 
         tabela_manual = pd.DataFrame([{
-            "Jogador": e.apelido, "Pos": e.posicao, "Clube": e.clube_abrev,
-            "Adversário": e.adversario_abrev, "Mando": "Casa" if e.casa else "Fora",
+            "Time": e.clube_escudo, "Jogador": e.apelido, "Pos": e.posicao,
+            "Contra": e.adversario_escudo, "Mando": "Casa" if e.casa else "Fora",
             "Preço": e.preco_num, "Previsão (modelo)": e.pred,
         } for e in escolhidos])
-        st.dataframe(tabela_manual, use_container_width=True, hide_index=True)
+        st.dataframe(
+            tabela_manual, use_container_width=True, hide_index=True,
+            column_config={
+                "Time": st.column_config.ImageColumn("Time", width="small"),
+                "Contra": st.column_config.ImageColumn("Contra", width="small"),
+            },
+        )
     else:
         st.caption("Escolha os jogadores acima para ver custo e previsão total.")
