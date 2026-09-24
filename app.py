@@ -30,7 +30,8 @@ FORMACOES = {
     "5-3-2": {1: 1, 2: 2, 3: 3, 4: 3, 5: 2, 6: 1},
     "5-4-1": {1: 1, 2: 2, 3: 3, 4: 4, 5: 1, 6: 1},
 }
-FEATS = ["media_3", "media_5", "media_temp", "jogos", "casa", "cedido", "forca", "posicao_id"]
+FEATS = ["media_3", "media_5", "media_temp", "jogos", "casa", "cedido", "forca", "posicao_id",
+         "rodadas_parado"]
 
 # Grupos de scout (ação detalhada de cada jogador na partida) que viram features extras —
 # um proxy do "porquê" da pontuação (parecido em espírito com xG, mas nativo do Cartola).
@@ -45,8 +46,14 @@ SCOUT_GRUPOS = {
 }
 SCOUT_COLS = list(SCOUT_GRUPOS)
 FEATS_SCOUT = [f"{c}_media5" for c in SCOUT_COLS]
-FEATS_FORMA = ["time_forma5", "time_saldo5", "time_ppg_mando", "adv_forma5", "adv_saldo5", "adv_ppg_mando"]
-FEATS = FEATS + FEATS_SCOUT + FEATS_FORMA
+FEATS_FORMA = ["time_forma5", "time_saldo5", "time_ppg_mando", "adv_forma5", "adv_saldo5", "adv_ppg_mando",
+               "time_posicao_tabela", "time_pontos_temporada", "adv_posicao_tabela", "adv_pontos_temporada"]
+# Limiar de "mitada": pontuação no top do percentil informado, por posição (mínimo absoluto de segurança).
+MITADA_PERCENTIL = 0.85
+MITADA_LIMIAR_MINIMO = 8.0
+FEATS_MITADA_CTX = ["cedido_mitada"]
+FEATS = FEATS + FEATS_SCOUT + FEATS_FORMA + FEATS_MITADA_CTX
+
 
 
 def _agregar_scout(scout):
@@ -127,10 +134,11 @@ def resultados_clubes(rodada_atual):
 
 
 def form_clubes(resultados):
-    """Para cada clube/rodada: forma recente (últimos 5 jogos), saldo de gols recente e
-    aproveitamento médio (pontos por jogo) jogando em casa ou fora — tudo calculado só com
-    jogos ANTERIORES à rodada (sem vazamento de informação)."""
-    cols_saida = ["rodada", "clube_id", "forma5", "saldo5", "ppg_mando"]
+    """Para cada clube/rodada: forma recente (últimos 5 jogos), saldo de gols recente,
+    aproveitamento médio (pontos por jogo) jogando em casa ou fora, e posição na tabela —
+    tudo calculado só com jogos ANTERIORES à rodada (sem vazamento de informação)."""
+    cols_saida = ["rodada", "clube_id", "forma5", "saldo5", "ppg_mando",
+                  "posicao_tabela", "pontos_temporada"]
     if resultados.empty:
         return pd.DataFrame(columns=cols_saida)
     r = resultados.sort_values(["clube_id", "rodada"]).copy()
@@ -139,6 +147,21 @@ def form_clubes(resultados):
     r["saldo5"] = r.groupby("clube_id")["saldo_jogo"].transform(lambda s: s.shift().rolling(5, 1).mean())
     r["ppg_mando"] = r.groupby(["clube_id", "mandante"])["pontos_jogo"].transform(
         lambda s: s.shift().expanding().mean())
+
+    # Classificação (pontos corridos), critérios de desempate: pontos > saldo > gols pró.
+    # Tudo usando só jogos ANTERIORES à rodada (shift), pra não vazar informação do futuro.
+    r["pontos_acum"] = r.groupby("clube_id")["pontos_jogo"].transform(lambda s: s.shift().expanding().sum())
+    r["saldo_acum"] = r.groupby("clube_id")["saldo_jogo"].transform(lambda s: s.shift().expanding().sum())
+    r["gols_acum"] = r.groupby("clube_id")["gols_pro"].transform(lambda s: s.shift().expanding().sum())
+    r["pontos_temporada"] = r["pontos_acum"]
+    r["posicao_tabela"] = np.nan
+    for _, idx in r.groupby("rodada").groups.items():
+        sub = r.loc[idx]
+        if sub["pontos_acum"].isna().all():
+            continue  # primeira rodada: ainda não existe classificação
+        sub = sub.sort_values(["pontos_acum", "saldo_acum", "gols_acum"], ascending=False)
+        r.loc[sub.index, "posicao_tabela"] = range(1, len(sub) + 1)
+
     return r[cols_saida]
 
 
@@ -322,6 +345,21 @@ def historico_meu_time(time_id, slug, rodada_atual):
     return pd.DataFrame(linhas), diagnostico
 
 
+def rotular_mitada(h):
+    """Marca, linha a linha, se aquela pontuação foi uma 'mitada' (top do percentil por
+    posição). Usado tanto para treinar o classificador quanto para calcular o quanto cada
+    adversário costuma CEDER mitadas."""
+    h = h.copy()
+    validas = h[h.pontos.notna()]
+    limiares = validas.groupby("posicao_id")["pontos"].quantile(MITADA_PERCENTIL)
+    limiares = limiares.clip(lower=MITADA_LIMIAR_MINIMO).to_dict()
+    h["mitada"] = [
+        (int(p >= limiares.get(pos, MITADA_LIMIAR_MINIMO)) if pd.notna(p) else np.nan)
+        for p, pos in zip(h.pontos, h.posicao_id)
+    ]
+    return h
+
+
 def features(h, forma_tab=None):
     h = h.sort_values(["atleta_id", "rodada"]).copy()
     g = h.groupby("atleta_id")["pontos"]
@@ -329,6 +367,13 @@ def features(h, forma_tab=None):
     h["media_5"] = g.transform(lambda s: s.shift().rolling(5, 1).mean())
     h["media_temp"] = g.transform(lambda s: s.shift().expanding().mean())
     h["jogos"] = g.transform(lambda s: s.shift().notna().cumsum())
+
+    # Rodadas desde a última vez que o jogador de fato entrou em campo — sem isso, um
+    # jogador que sumiu do time (banco/lesão) continua "parecendo" em forma pelas médias
+    # antigas. Isso não estraga a média (que já só considera jogos reais), só avisa o
+    # modelo quando esses jogos reais ficaram velhos.
+    h["ultima_jogada"] = h.groupby("atleta_id")["rodada"].transform(lambda s: s.shift())
+    h["rodadas_parado"] = h["rodada"] - h["ultima_jogada"]
 
     for col in SCOUT_COLS:
         if col not in h.columns:
@@ -342,19 +387,30 @@ def features(h, forma_tab=None):
         lambda s: s.shift().expanding().mean())
     h = h.merge(ced.drop(columns="pontos"), on=["adversario", "posicao_id", "rodada"], how="left")
 
+    h = rotular_mitada(h)
+    ced_mit = (h.groupby(["adversario", "posicao_id", "rodada"])["mitada"].mean()
+               .reset_index().sort_values("rodada"))
+    ced_mit["cedido_mitada"] = ced_mit.groupby(["adversario", "posicao_id"])["mitada"].transform(
+        lambda s: s.shift().expanding().mean())
+    h = h.merge(ced_mit.drop(columns="mitada"), on=["adversario", "posicao_id", "rodada"], how="left")
+
     fc = h.groupby(["clube_id", "rodada"])["pontos"].mean().reset_index().sort_values("rodada")
     fc["forca"] = fc.groupby("clube_id")["pontos"].transform(lambda s: s.shift().expanding().mean())
     h = h.merge(fc.drop(columns="pontos"), on=["clube_id", "rodada"], how="left")
 
     if forma_tab is not None and not forma_tab.empty:
         proprio = forma_tab.rename(columns={
-            "forma5": "time_forma5", "saldo5": "time_saldo5", "ppg_mando": "time_ppg_mando"})
-        h = h.merge(proprio[["clube_id", "rodada", "time_forma5", "time_saldo5", "time_ppg_mando"]],
+            "forma5": "time_forma5", "saldo5": "time_saldo5", "ppg_mando": "time_ppg_mando",
+            "posicao_tabela": "time_posicao_tabela", "pontos_temporada": "time_pontos_temporada"})
+        h = h.merge(proprio[["clube_id", "rodada", "time_forma5", "time_saldo5", "time_ppg_mando",
+                              "time_posicao_tabela", "time_pontos_temporada"]],
                     on=["clube_id", "rodada"], how="left")
         adversario_tab = forma_tab.rename(columns={
-            "clube_id": "adversario", "forma5": "adv_forma5",
-            "saldo5": "adv_saldo5", "ppg_mando": "adv_ppg_mando"})
-        h = h.merge(adversario_tab[["adversario", "rodada", "adv_forma5", "adv_saldo5", "adv_ppg_mando"]],
+            "clube_id": "adversario", "forma5": "adv_forma5", "saldo5": "adv_saldo5",
+            "ppg_mando": "adv_ppg_mando", "posicao_tabela": "adv_posicao_tabela",
+            "pontos_temporada": "adv_pontos_temporada"})
+        h = h.merge(adversario_tab[["adversario", "rodada", "adv_forma5", "adv_saldo5", "adv_ppg_mando",
+                                     "adv_posicao_tabela", "adv_pontos_temporada"]],
                     on=["adversario", "rodada"], how="left")
     else:
         for col in FEATS_FORMA:
@@ -380,18 +436,13 @@ def treinar(h):
     return m, validacao
 
 
-def treinar_mitada(h, percentil=0.85, limiar_minimo=8.0):
+def treinar_mitada(h):
     """Classificador de 'índice mitada': probabilidade do jogador ter uma pontuação muito
-    acima do normal (top do percentil informado, por posição) na próxima rodada."""
+    acima do normal (top do percentil configurado, por posição) na próxima rodada."""
     dados = h[h.pontos.notna() & (h.jogos >= 1)].copy()
-    if len(dados) < 300:
+    if len(dados) < 300 or "mitada" not in dados.columns:
         return None
-    limiares = dados.groupby("posicao_id")["pontos"].quantile(percentil)
-    limiares = limiares.clip(lower=limiar_minimo).to_dict()
-    dados["mitada"] = [
-        int(p >= limiares.get(pos, limiar_minimo))
-        for p, pos in zip(dados.pontos, dados.posicao_id)
-    ]
+    dados = dados.dropna(subset=["mitada"])
     if dados["mitada"].nunique() < 2:
         return None  # sem exemplos suficientes de ambas as classes ainda
     m = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.05, max_depth=4)
@@ -675,6 +726,18 @@ st.markdown(
         pointer-events: none;
     }
     .mini-hist:hover .mini-tooltip { visibility: visible; opacity: 1; }
+
+    /* "Campo de futebol" por trás da escalação montada */
+    .st-key-campo_futebol {
+        background:
+            repeating-linear-gradient(180deg, #1c5c2e 0px, #1c5c2e 48px, #1e6432 48px, #1e6432 96px);
+        border: 3px solid rgba(255,255,255,.6);
+        border-radius: 16px;
+        padding: 16px 14px 20px 14px;
+    }
+    .st-key-campo_futebol .stCaption, .st-key-campo_futebol p {
+        color: #eaf4ec !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -778,15 +841,39 @@ with tab_auto:
         m1.metric("Pontuação prevista", f"{total:.1f} pts")
         m2.metric("Custo total", f"C$ {escalados.preco_num.sum():.2f}")
 
-        for pos_id in [1, 2, 3, 4, 5, 6]:
-            linha_pos = escalados[escalados.posicao_id == pos_id]
-            if linha_pos.empty:
-                continue
-            st.caption(f"**{POS[pos_id]}**")
-            cols = st.columns(len(linha_pos))
-            for col, (_, row) in zip(cols, linha_pos.iterrows()):
-                with col:
-                    cartao_jogador(row)
+        with st.container(key="campo_futebol"):
+            # Ordem visual: ataque no topo (perto do gol adversário) até o goleiro embaixo
+            # (perto do próprio gol) — igual um campo de futebol de verdade, de cima pra baixo.
+            for pos_id in [5, 4, 3, 2]:  # ATA, MEI, ZAG, LAT
+                linha_pos = escalados[escalados.posicao_id == pos_id]
+                if linha_pos.empty:
+                    continue
+                st.caption(f"**{POS[pos_id]}**")
+                cols = st.columns(len(linha_pos))
+                for col, (_, row) in zip(cols, linha_pos.iterrows()):
+                    with col:
+                        cartao_jogador(row)
+
+            # Goleiro e técnico juntos na última linha, técnico à direita
+            gol_linha = escalados[escalados.posicao_id == 1]
+            tec_linha = escalados[escalados.posicao_id == 6]
+            if not gol_linha.empty or not tec_linha.empty:
+                st.markdown(
+                    '<div style="border-top:3px dashed rgba(255,255,255,.5);'
+                    'margin:4px 0 10px 0;"></div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("**GOL / TEC**")
+                cols = st.columns(len(gol_linha) + len(tec_linha) or 1)
+                i = 0
+                for _, row in gol_linha.iterrows():
+                    with cols[i]:
+                        cartao_jogador(row)
+                    i += 1
+                for _, row in tec_linha.iterrows():
+                    with cols[i]:
+                        cartao_jogador(row)
+                    i += 1
 
         csv = escalados.to_csv(index=False).encode("utf-8")
         st.download_button("Baixar CSV da escalação", csv, f"escalacao_rodada_{rodada}.csv")
