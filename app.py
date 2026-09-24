@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from scipy.optimize import milp, LinearConstraint, Bounds
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.metrics import mean_absolute_error
 
 API = "https://api.cartola.globo.com"
@@ -31,6 +31,32 @@ FORMACOES = {
     "5-4-1": {1: 1, 2: 2, 3: 3, 4: 4, 5: 1, 6: 1},
 }
 FEATS = ["media_3", "media_5", "media_temp", "jogos", "casa", "cedido", "forca", "posicao_id"]
+
+# Grupos de scout (ação detalhada de cada jogador na partida) que viram features extras —
+# um proxy do "porquê" da pontuação (parecido em espírito com xG, mas nativo do Cartola).
+SCOUT_GRUPOS = {
+    "finalizacoes": ("FT", "FD", "FF", "G"),   # volume de finalização/criação de gol
+    "gols": ("G",),
+    "assistencias": ("A",),
+    "desarmes": ("DS",),
+    "faltas_sofridas": ("FS",),
+    "sg": ("SG",),                              # jogo sem sofrer gols (defesa/goleiro)
+    "cartoes": ("CA", "CV"),
+}
+SCOUT_COLS = list(SCOUT_GRUPOS)
+FEATS_SCOUT = [f"{c}_media5" for c in SCOUT_COLS]
+FEATS = FEATS + FEATS_SCOUT
+
+
+def _agregar_scout(scout):
+    scout = scout or {}
+    valores = {}
+    for nome, codigos in SCOUT_GRUPOS.items():
+        if nome == "cartoes":
+            valores[nome] = (scout.get("CA") or 0) + 2 * (scout.get("CV") or 0)
+        else:
+            valores[nome] = sum(scout.get(c) or 0 for c in codigos)
+    return valores
 
 
 # ---------------------------------------------------------------- coleta
@@ -73,9 +99,11 @@ def historico(rodada_atual):
             if a["clube_id"] not in mando:
                 continue
             casa, adv = mando[a["clube_id"]]
-            linhas.append(dict(rodada=r, atleta_id=int(aid), clube_id=a["clube_id"],
-                               posicao_id=a["posicao_id"], pontos=a["pontuacao"],
-                               casa=casa, adversario=adv))
+            linha = dict(rodada=r, atleta_id=int(aid), clube_id=a["clube_id"],
+                         posicao_id=a["posicao_id"], pontos=a["pontuacao"],
+                         casa=casa, adversario=adv)
+            linha.update(_agregar_scout(a.get("scout")))
+            linhas.append(linha)
     return pd.DataFrame(linhas)
 
 
@@ -151,6 +179,12 @@ def features(h):
     h["media_temp"] = g.transform(lambda s: s.shift().expanding().mean())
     h["jogos"] = g.transform(lambda s: s.shift().notna().cumsum())
 
+    for col in SCOUT_COLS:
+        if col not in h.columns:
+            h[col] = 0.0
+        h[f"{col}_media5"] = h.groupby("atleta_id")[col].transform(
+            lambda s: s.shift().rolling(5, 1).mean())
+
     ced = (h.groupby(["adversario", "posicao_id", "rodada"])["pontos"].mean()
            .reset_index().sort_values("rodada"))
     ced["cedido"] = ced.groupby(["adversario", "posicao_id"])["pontos"].transform(
@@ -178,6 +212,25 @@ def treinar(h):
     m = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, max_depth=4)
     m.fit(treino[FEATS], treino.pontos)
     return m, validacao
+
+
+def treinar_mitada(h, percentil=0.85, limiar_minimo=8.0):
+    """Classificador de 'índice mitada': probabilidade do jogador ter uma pontuação muito
+    acima do normal (top do percentil informado, por posição) na próxima rodada."""
+    dados = h[h.pontos.notna() & (h.jogos >= 1)].copy()
+    if len(dados) < 300:
+        return None
+    limiares = dados.groupby("posicao_id")["pontos"].quantile(percentil)
+    limiares = limiares.clip(lower=limiar_minimo).to_dict()
+    dados["mitada"] = [
+        int(p >= limiares.get(pos, limiar_minimo))
+        for p, pos in zip(dados.pontos, dados.posicao_id)
+    ]
+    if dados["mitada"].nunique() < 2:
+        return None  # sem exemplos suficientes de ambas as classes ainda
+    m = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.05, max_depth=4)
+    m.fit(dados[FEATS], dados["mitada"])
+    return m
 
 
 def otimizar(df, cartoletas, formacao, mult_cap):
@@ -312,6 +365,7 @@ def montar_base():
     alvo = tudo[tudo.rodada == rodada].set_index("atleta_id")
 
     modelo, validacao = treinar(tudo[tudo.rodada < rodada])
+    modelo_mitada = treinar_mitada(tudo[tudo.rodada < rodada])
     atl = atl.set_index("atleta_id")
     if modelo is None:
         atl["pred"] = atl.media_num
@@ -319,6 +373,10 @@ def montar_base():
         atl["pred"] = modelo.predict(alvo.loc[atl.index, FEATS])
         sem_jogo = alvo.loc[atl.index, "jogos"].fillna(0).values == 0
         atl.loc[sem_jogo, "pred"] = atl.loc[sem_jogo, "media_num"] * 0.8
+    if modelo_mitada is not None:
+        atl["prob_mitada"] = modelo_mitada.predict_proba(alvo.loc[atl.index, FEATS])[:, 1]
+    else:
+        atl["prob_mitada"] = np.nan
     atl = atl.reset_index()
     atl["clube_abrev"] = atl.clube_id.map(clubes)
     atl["clube_escudo"] = atl.clube_id.map(escudos)
@@ -349,6 +407,13 @@ def cartao_jogador(row, largura=148):
     adv_escudo = row.get("adversario_escudo")
     hist = row.get("hist_pontos") or []
     hist = [j for j in hist if isinstance(j, dict) and "pontos" in j]
+
+    prob_mitada = row.get("prob_mitada")
+    if prob_mitada is not None and pd.notna(prob_mitada):
+        mitada_html = (f'<span title="Chance de pontuação muito acima do normal">'
+                        f'🔥 {prob_mitada * 100:.0f}%</span>')
+    else:
+        mitada_html = ""
 
     foto_html = (
         f'<img src="{foto}" style="width:64px;height:64px;border-radius:50%;object-fit:cover;'
@@ -412,6 +477,7 @@ def cartao_jogador(row, largura=148):
                         font-size:11px;font-weight:700;border-top:1px solid #7a4e0a;padding-top:5px;">
                 <span title="Preço na rodada">💰 C$ {row.preco_num:.1f}</span>
                 <span title="Previsão do modelo">📈 {row.pred:.1f} pts</span>
+                {mitada_html}
             </div>
             {hist_html}
         </div>
@@ -523,17 +589,22 @@ with tab_auto:
     pos_filtro = st.multiselect("Filtrar posição", options=list(POS.values()),
                                  default=list(POS.values()), key="filtro_auto")
     tabela = atl_disp[atl_disp.posicao.isin(pos_filtro)][
-        ["clube_escudo", "apelido", "posicao", "adversario_escudo", "casa", "preco_num", "media_num", "pred"]
+        ["clube_escudo", "apelido", "posicao", "adversario_escudo", "casa",
+         "preco_num", "media_num", "pred", "prob_mitada"]
     ].rename(columns={
         "clube_escudo": "Time", "apelido": "Jogador", "posicao": "Pos", "adversario_escudo": "Contra",
         "casa": "Mando", "preco_num": "Preço", "media_num": "Média Cartola", "pred": "Previsão (modelo)",
+        "prob_mitada": "Chance de mitar",
     }).sort_values("Previsão (modelo)", ascending=False)
     tabela["Mando"] = tabela["Mando"].map({1: "Casa", 0: "Fora"})
+    tabela["Chance de mitar"] = tabela["Chance de mitar"] * 100
     st.dataframe(
         tabela, use_container_width=True, hide_index=True,
         column_config={
             "Time": st.column_config.ImageColumn("Time", width="small"),
             "Contra": st.column_config.ImageColumn("Contra", width="small"),
+            "Chance de mitar": st.column_config.ProgressColumn(
+                "Chance de mitar", format="%.0f%%", min_value=0, max_value=100),
         },
     )
 
@@ -600,7 +671,9 @@ with tab_manual:
                     f"{POS[pos_id]} {i + 1}", ids,
                     format_func=lambda x: "— selecione —" if x is None
                     else f"{lookup[x].apelido} ({lookup[x].clube_abrev}) "
-                         f"| 💰C$ {lookup[x].preco_num:.2f}  📈{lookup[x].pred:.2f}pts",
+                         f"| 💰C$ {lookup[x].preco_num:.2f}  📈{lookup[x].pred:.2f}pts"
+                         + (f"  🔥{lookup[x].prob_mitada * 100:.0f}%"
+                            if pd.notna(lookup[x].get("prob_mitada")) else ""),
                     key=f"manual_{formacao_manual}_{pos_id}_{i}",
                 )
 
@@ -626,12 +699,15 @@ with tab_manual:
             "Time": e.clube_escudo, "Jogador": e.apelido, "Pos": e.posicao,
             "Contra": e.adversario_escudo, "Mando": "Casa" if e.casa else "Fora",
             "Preço": e.preco_num, "Previsão (modelo)": e.pred,
+            "Chance de mitar": (e.prob_mitada * 100) if pd.notna(e.get("prob_mitada")) else None,
         } for e in escolhidos])
         st.dataframe(
             tabela_manual, use_container_width=True, hide_index=True,
             column_config={
                 "Time": st.column_config.ImageColumn("Time", width="small"),
                 "Contra": st.column_config.ImageColumn("Contra", width="small"),
+                "Chance de mitar": st.column_config.ProgressColumn(
+                    "Chance de mitar", format="%.0f%%", min_value=0, max_value=100),
             },
         )
     else:
