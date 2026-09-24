@@ -79,6 +79,32 @@ def historico(rodada_atual):
     return pd.DataFrame(linhas)
 
 
+def buscar_times(nome):
+    """Busca pública por nome de time no Cartola — não precisa de login/senha."""
+    return api_get(f"/times?q={requests.utils.quote(nome)}", cache=False)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def historico_meu_time(slug, rodada_atual):
+    """Busca, rodada a rodada, a pontuação de um time específico (rota pública por slug)."""
+    linhas = []
+    for r in range(1, rodada_atual):
+        try:
+            d = api_get(f"/time/slug/{slug}/{r}", cache=True)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("pontos") is None:
+            continue
+        esquema = d.get("esquema")
+        linhas.append({
+            "rodada": r,
+            "pontos": float(d["pontos"]),
+            "patrimonio": d.get("patrimonio"),
+            "esquema": esquema.get("nome") if isinstance(esquema, dict) else esquema,
+        })
+    return pd.DataFrame(linhas)
+
+
 def features(h):
     h = h.sort_values(["atleta_id", "rodada"]).copy()
     g = h.groupby("atleta_id")["pontos"]
@@ -337,7 +363,8 @@ if validacao:
 
 atl_disp = atl[~atl.apelido.isin(excluir_nomes)].copy()
 
-tab_auto, tab_manual = st.tabs(["🤖 Escalação automática", "🛠️ Montar manualmente"])
+tab_auto, tab_manual, tab_meu = st.tabs(
+    ["🤖 Escalação automática", "🛠️ Montar manualmente", "📊 Meu desempenho"])
 
 # ============================== ABA 1 — AUTOMÁTICA ==============================
 with tab_auto:
@@ -491,3 +518,70 @@ with tab_manual:
         )
     else:
         st.caption("Escolha os jogadores acima para ver custo e previsão total.")
+
+# ============================== ABA 3 — MEU DESEMPENHO ==============================
+with tab_meu:
+    st.subheader("Seu histórico no Cartola")
+    st.caption(
+        "Busca pública pelo nome do seu time (o mesmo usado no app oficial do Cartola). "
+        "Não pede sua senha — só funciona se o seu time estiver com o perfil público, "
+        "que é o padrão."
+    )
+
+    nome_time = st.text_input("Nome do seu time no Cartola", key="nome_time_busca")
+    if st.button("Buscar meu time"):
+        if not nome_time.strip():
+            st.warning("Digite o nome do time primeiro.")
+        else:
+            try:
+                resultados = buscar_times(nome_time.strip())
+            except Exception as e:
+                resultados = None
+                st.error(f"Não consegui buscar agora: {e}")
+            if resultados is not None:
+                if not resultados:
+                    st.warning("Nenhum time encontrado com esse nome.")
+                st.session_state["times_encontrados"] = resultados
+
+    resultados = st.session_state.get("times_encontrados")
+    if resultados:
+        opcoes = {
+            f"{t.get('nome', '?')} — {(t.get('time', {}) or {}).get('nome_cartola', t.get('nome_cartola', ''))}"
+            .strip(" —"): t
+            for t in resultados
+        }
+        escolha = st.selectbox("Selecione o seu time", list(opcoes.keys()), key="time_escolhido")
+        time_sel = opcoes[escolha]
+        slug = time_sel.get("slug") or (time_sel.get("time", {}) or {}).get("slug")
+
+        if not slug:
+            st.error("Não encontrei o identificador (slug) desse time na resposta da API.")
+            with st.expander("Ver dados brutos recebidos (para depuração)"):
+                st.json(time_sel)
+        elif st.button("Carregar meu histórico de pontuação"):
+            with st.spinner("Buscando pontuação rodada a rodada..."):
+                hist_time = historico_meu_time(slug, rodada)
+            if hist_time.empty:
+                st.warning(
+                    "Não consegui ler a pontuação por rodada — talvez o formato da resposta "
+                    "tenha mudado. Me avise para eu ajustar."
+                )
+            else:
+                media = hist_time.pontos.mean()
+                melhor = hist_time.loc[hist_time.pontos.idxmax()]
+                pior = hist_time.loc[hist_time.pontos.idxmin()]
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Média por rodada", f"{media:.1f} pts")
+                c2.metric("Melhor rodada", f"R{int(melhor.rodada)} · {melhor.pontos:.1f} pts")
+                c3.metric("Pior rodada", f"R{int(pior.rodada)} · {pior.pontos:.1f} pts")
+
+                st.line_chart(hist_time.set_index("rodada")["pontos"])
+                st.dataframe(
+                    hist_time.rename(columns={
+                        "rodada": "Rodada", "pontos": "Pontos", "patrimonio": "Patrimônio",
+                        "esquema": "Esquema",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+
