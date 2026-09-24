@@ -148,8 +148,14 @@ def montar_base():
 
     merc = api_get("/atletas/mercado", cache=False)
     clubes = {int(k): v["abreviacao"] for k, v in merc["clubes"].items()}
+    escudos = {int(k): (v.get("escudos") or {}).get("60x60") for k, v in merc["clubes"].items()}
     atl = pd.DataFrame(merc["atletas"])
     atl = atl[atl.status_id == PROVAVEL].copy()
+    if "foto" in atl.columns:
+        atl["foto_url"] = atl["foto"].apply(
+            lambda u: u.replace("FORMATO", "140x140") if isinstance(u, str) else None)
+    else:
+        atl["foto_url"] = None
     mando = mandos(api_get("/partidas", cache=False))
     atl = atl[atl.clube_id.isin(mando.keys())].copy()
     atl["casa"] = atl.clube_id.map(lambda c: mando[c][0])
@@ -171,9 +177,41 @@ def montar_base():
         atl.loc[sem_jogo, "pred"] = atl.loc[sem_jogo, "media_num"] * 0.8
     atl = atl.reset_index()
     atl["clube_abrev"] = atl.clube_id.map(clubes)
+    atl["clube_escudo"] = atl.clube_id.map(escudos)
     atl["adversario_abrev"] = atl.adversario.map(clubes)
+    atl["adversario_escudo"] = atl.adversario.map(escudos)
     atl["posicao"] = atl.posicao_id.map(POS)
     return atl, rodada, aberto, validacao, mando
+
+
+def cartao_jogador(row, largura_foto=76):
+    """HTML compacto com foto do jogador, escudo do clube e os números principais."""
+    cap_badge = " 🅲" if bool(row.get("capitao", False)) else ""
+    foto = row.get("foto_url")
+    escudo = row.get("clube_escudo")
+    foto_html = (f'<img src="{foto}" width="{largura_foto}" '
+                 f'style="border-radius:10px;object-fit:cover;">' if foto else
+                 f'<div style="width:{largura_foto}px;height:{largura_foto}px;border-radius:10px;'
+                 f'background:#eee;display:flex;align-items:center;justify-content:center;'
+                 f'font-size:26px;">👤</div>')
+    escudo_html = f'<img src="{escudo}" width="16" style="vertical-align:middle;margin-right:3px;">' if escudo else ""
+    st.markdown(
+        f"""
+        <div style="text-align:center;margin-bottom:10px;">
+            {foto_html}
+            <div style="margin-top:4px;font-weight:600;font-size:13px;line-height:1.2;">
+                {row.apelido}{cap_badge}
+            </div>
+            <div style="font-size:11px;color:#888;">
+                {escudo_html}{row.clube_abrev} x {row.adversario_abrev} · {"casa" if row.casa else "fora"}
+            </div>
+            <div style="font-size:12px;margin-top:2px;">
+                💰 C$ {row.preco_num:.2f} &nbsp;·&nbsp; 📈 {row.pred:.2f} pts
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ============================== INTERFACE ==============================
@@ -186,7 +224,6 @@ with st.sidebar:
                                   value=120.0, step=0.5)
     formacao = st.selectbox("Formação", ["auto"] + list(FORMACOES))
     mult_cap = st.slider("Multiplicador do capitão", 1.0, 2.0, 1.5, 0.1)
-    gerar = st.button("Gerar escalação", type="primary")
 
 with st.spinner("Baixando dados do Cartola e calculando previsões..."):
     atl, rodada, aberto, validacao, mando = montar_base()
@@ -207,46 +244,50 @@ tab_auto, tab_manual = st.tabs(["🤖 Escalação automática", "🛠️ Montar 
 
 # ============================== ABA 1 — AUTOMÁTICA ==============================
 with tab_auto:
-    col1, col2 = st.columns([1, 2])
+    forms = list(FORMACOES) if formacao == "auto" else [formacao]
+    melhor = None
+    for f in forms:
+        r = otimizar(atl_disp, cartoletas, f, mult_cap)
+        if r and (melhor is None or r[1] > melhor[1]):
+            melhor = (r[0], r[1], f)
 
-    if gerar:
-        forms = list(FORMACOES) if formacao == "auto" else [formacao]
-        melhor = None
-        for f in forms:
-            r = otimizar(atl_disp, cartoletas, f, mult_cap)
-            if r and (melhor is None or r[1] > melhor[1]):
-                melhor = (r[0], r[1], f)
+    if melhor is None:
+        st.error("Nenhuma escalação possível com esse orçamento/formação.")
+    else:
+        time_, total, f = melhor
+        escalados = time_.sort_values(["posicao_id", "pred"], ascending=[True, False])
 
-        if melhor is None:
-            st.error("Nenhuma escalação possível com esse orçamento/formação.")
-        else:
-            time_, total, f = melhor
-            with col1:
-                st.subheader(f"Formação {f}")
-                st.metric("Pontuação prevista", f"{total:.1f} pts")
-                st.metric("Custo total", f"C$ {time_.preco_num.sum():.2f}")
-                escalados = time_.sort_values(["posicao_id", "pred"], ascending=[True, False])
-                for _, j in escalados.iterrows():
-                    cap = " 🅲" if j.capitao else ""
-                    st.write(f"**{j.posicao}** — {j.apelido} ({j.clube_abrev} x {j.adversario_abrev}, "
-                             f"{'casa' if j.casa else 'fora'}) · C$ {j.preco_num:.2f} · "
-                             f"prev {j.pred:.2f}{cap}")
-                csv = escalados.to_csv(index=False).encode("utf-8")
-                st.download_button("Baixar CSV da escalação", csv, f"escalacao_rodada_{rodada}.csv")
+        st.subheader(f"Formação {f}")
+        m1, m2 = st.columns(2)
+        m1.metric("Pontuação prevista", f"{total:.1f} pts")
+        m2.metric("Custo total", f"C$ {escalados.preco_num.sum():.2f}")
 
-    with col2 if gerar else st.container():
-        st.subheader("Previsão jogador a jogador")
-        st.caption("Todos os jogadores prováveis, com a pontuação que o modelo espera para a rodada.")
-        pos_filtro = st.multiselect("Filtrar posição", options=list(POS.values()),
-                                     default=list(POS.values()), key="filtro_auto")
-        tabela = atl_disp[atl_disp.posicao.isin(pos_filtro)][
-            ["apelido", "posicao", "clube_abrev", "adversario_abrev", "casa", "preco_num", "media_num", "pred"]
-        ].rename(columns={
-            "apelido": "Jogador", "posicao": "Pos", "clube_abrev": "Clube", "adversario_abrev": "Adversário",
-            "casa": "Mando", "preco_num": "Preço", "media_num": "Média Cartola", "pred": "Previsão (modelo)",
-        }).sort_values("Previsão (modelo)", ascending=False)
-        tabela["Mando"] = tabela["Mando"].map({1: "Casa", 0: "Fora"})
-        st.dataframe(tabela, use_container_width=True, hide_index=True)
+        for pos_id in [1, 2, 3, 4, 5, 6]:
+            linha_pos = escalados[escalados.posicao_id == pos_id]
+            if linha_pos.empty:
+                continue
+            st.caption(f"**{POS[pos_id]}**")
+            cols = st.columns(len(linha_pos))
+            for col, (_, row) in zip(cols, linha_pos.iterrows()):
+                with col:
+                    cartao_jogador(row)
+
+        csv = escalados.to_csv(index=False).encode("utf-8")
+        st.download_button("Baixar CSV da escalação", csv, f"escalacao_rodada_{rodada}.csv")
+
+    st.divider()
+    st.subheader("Previsão jogador a jogador")
+    st.caption("Todos os jogadores prováveis, com a pontuação que o modelo espera para a rodada.")
+    pos_filtro = st.multiselect("Filtrar posição", options=list(POS.values()),
+                                 default=list(POS.values()), key="filtro_auto")
+    tabela = atl_disp[atl_disp.posicao.isin(pos_filtro)][
+        ["apelido", "posicao", "clube_abrev", "adversario_abrev", "casa", "preco_num", "media_num", "pred"]
+    ].rename(columns={
+        "apelido": "Jogador", "posicao": "Pos", "clube_abrev": "Clube", "adversario_abrev": "Adversário",
+        "casa": "Mando", "preco_num": "Preço", "media_num": "Média Cartola", "pred": "Previsão (modelo)",
+    }).sort_values("Previsão (modelo)", ascending=False)
+    tabela["Mando"] = tabela["Mando"].map({1: "Casa", 0: "Fora"})
+    st.dataframe(tabela, use_container_width=True, hide_index=True)
 
 # ============================== ABA 2 — MANUAL ==============================
 with tab_manual:
@@ -310,15 +351,15 @@ with tab_manual:
                 escolha_id = st.selectbox(
                     f"{POS[pos_id]} {i + 1}", ids,
                     format_func=lambda x: "— selecione —" if x is None
-                    else f"{lookup[x].apelido} ({lookup[x].clube_abrev}) · C$ {lookup[x].preco_num:.2f}",
+                    else f"{lookup[x].apelido} ({lookup[x].clube_abrev}) "
+                         f"| 💰C$ {lookup[x].preco_num:.2f}  📈{lookup[x].pred:.2f}pts",
                     key=f"manual_{formacao_manual}_{pos_id}_{i}",
                 )
 
                 if escolha_id is not None:
                     linha = lookup[escolha_id]
                     escolhidos.append(linha)
-                    adv_txt = f"x {linha.adversario_abrev} ({'casa' if linha.casa else 'fora'})"
-                    st.caption(f"{adv_txt} · previsão {linha.pred:.2f} pts")
+                    cartao_jogador(linha, largura_foto=56)
 
     st.divider()
     if escolhidos:
