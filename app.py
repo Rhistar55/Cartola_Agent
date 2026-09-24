@@ -84,25 +84,63 @@ def buscar_times(nome):
     return api_get(f"/times?q={requests.utils.quote(nome)}", cache=False)
 
 
+def extrair_id_slug(time_sel):
+    """Tenta achar o id numérico e o slug do time, cobrindo variações de formato da resposta."""
+    aninhado = time_sel.get("time") if isinstance(time_sel.get("time"), dict) else {}
+
+    def _achar(chaves, fonte):
+        for k in chaves:
+            v = fonte.get(k)
+            if v not in (None, ""):
+                return v
+        return None
+
+    time_id = _achar(["time_id", "id"], time_sel) or _achar(["time_id", "id"], aninhado)
+    slug = _achar(["slug"], time_sel) or _achar(["slug"], aninhado)
+    try:
+        time_id = int(time_id) if time_id is not None else None
+    except (TypeError, ValueError):
+        time_id = None
+    return time_id, slug
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def historico_meu_time(slug, rodada_atual):
-    """Busca, rodada a rodada, a pontuação de um time específico (rota pública por slug)."""
+def historico_meu_time(time_id, slug, rodada_atual):
+    """Busca, rodada a rodada, a pontuação de um time específico.
+    Tenta pelo id numérico e depois pelo slug, guardando o que deu errado na primeira
+    tentativa para exibir como diagnóstico se nada funcionar."""
     linhas = []
+    diagnostico = None
+    rotas_base = []
+    if time_id:
+        rotas_base.append(("id", f"/time/id/{time_id}"))
+    if slug:
+        rotas_base.append(("slug", f"/time/slug/{slug}"))
+
     for r in range(1, rodada_atual):
-        try:
-            d = api_get(f"/time/slug/{slug}/{r}", cache=True)
-        except Exception:
+        encontrado = False
+        for tipo, base in rotas_base:
+            try:
+                d = api_get(f"{base}/{r}", cache=True)
+            except Exception as e:
+                if diagnostico is None:
+                    diagnostico = {"tentativa": f"{base}/{r}", "erro": str(e)}
+                continue
+            if isinstance(d, dict) and d.get("pontos") is not None:
+                esquema = d.get("esquema")
+                linhas.append({
+                    "rodada": r,
+                    "pontos": float(d["pontos"]),
+                    "patrimonio": d.get("patrimonio"),
+                    "esquema": esquema.get("nome") if isinstance(esquema, dict) else esquema,
+                })
+                encontrado = True
+                break
+            elif diagnostico is None:
+                diagnostico = {"tentativa": f"{base}/{r}", "resposta_recebida": d}
+        if not encontrado:
             continue
-        if not isinstance(d, dict) or d.get("pontos") is None:
-            continue
-        esquema = d.get("esquema")
-        linhas.append({
-            "rodada": r,
-            "pontos": float(d["pontos"]),
-            "patrimonio": d.get("patrimonio"),
-            "esquema": esquema.get("nome") if isinstance(esquema, dict) else esquema,
-        })
-    return pd.DataFrame(linhas)
+    return pd.DataFrame(linhas), diagnostico
 
 
 def features(h):
@@ -163,6 +201,86 @@ def otimizar(df, cartoletas, formacao, mult_cap):
     time_ = df[x].copy()
     time_["capitao"] = c[x]
     return time_, -res.fun
+
+
+def comparativo_rodadas(hist_time, rodada_atual, cartoletas_padrao, formacao_escolhida, mult_cap, n_rodadas):
+    """Para cada uma das últimas `n_rodadas`, recalcula o que o modelo teria escalado
+    (treinando só com dados até a rodada anterior) e o time ideal em retrospecto (sabendo
+    o resultado real), e compara com a pontuação que o usuário de fato fez."""
+    elegiveis = hist_time[hist_time.rodada >= 2].sort_values("rodada").tail(n_rodadas)
+    formas = list(FORMACOES) if formacao_escolhida == "auto" else [formacao_escolhida]
+    linhas_resultado = []
+
+    for _, linha_usuario in elegiveis.iterrows():
+        r = int(linha_usuario.rodada)
+        try:
+            pont = api_get(f"/atletas/pontuados/{r}")
+            mando_r = mandos(api_get(f"/partidas/{r}"))
+        except Exception:
+            continue
+
+        registros = []
+        for aid, a in (pont.get("atletas") or {}).items():
+            if a["clube_id"] not in mando_r:
+                continue
+            casa, adv = mando_r[a["clube_id"]]
+            registros.append(dict(atleta_id=int(aid), clube_id=a["clube_id"], posicao_id=a["posicao_id"],
+                                   pontos_real=float(a["pontuacao"]), casa=casa, adversario=adv,
+                                   preco_num=a.get("preco_num")))
+        rodada_df = pd.DataFrame(registros)
+        if rodada_df.empty:
+            continue
+        if rodada_df["preco_num"].isna().all():
+            # essa rodada não trouxe preço histórico: usa o preço atual como aproximação
+            rodada_df = rodada_df.drop(columns=["preco_num"]).merge(
+                atl_disp[["atleta_id", "preco_num"]], on="atleta_id", how="left")
+        rodada_df = rodada_df.dropna(subset=["preco_num"]).reset_index(drop=True)
+        if rodada_df.empty:
+            continue
+
+        h_treino = historico(r)
+        alvo_rows = rodada_df[["atleta_id", "clube_id", "posicao_id", "casa", "adversario"]].assign(
+            rodada=r, pontos=np.nan)
+        tudo_r = features(pd.concat([h_treino, alvo_rows], ignore_index=True))
+        alvo_feats = tudo_r[tudo_r.rodada == r].set_index("atleta_id")
+        modelo_r, _ = treinar(tudo_r[tudo_r.rodada < r])
+
+        rodada_df = rodada_df.set_index("atleta_id")
+        if modelo_r is None:
+            continue  # histórico curto demais nessa rodada pra treinar algo minimamente confiável
+        rodada_df["pred"] = modelo_r.predict(alvo_feats.loc[rodada_df.index, FEATS])
+        rodada_df = rodada_df.reset_index()
+
+        orcamento = linha_usuario.patrimonio if pd.notna(linha_usuario.get("patrimonio")) else cartoletas_padrao
+
+        def _melhor(df_otim):
+            melhor = None
+            for f in formas:
+                res = otimizar(df_otim, orcamento, f, mult_cap)
+                if res and (melhor is None or res[1] > melhor[1]):
+                    melhor = res
+            return melhor
+
+        melhor_modelo = _melhor(rodada_df)
+        rodada_ideal = rodada_df.copy()
+        rodada_ideal["pred"] = rodada_ideal["pontos_real"]
+        melhor_ideal = _melhor(rodada_ideal)
+
+        def _pontos_reais_do_time(resultado):
+            if not resultado:
+                return None
+            time_, _ = resultado
+            extra_capitao = time_.loc[time_.capitao, "pontos_real"].sum() * (mult_cap - 1)
+            return float(time_.pontos_real.sum() + extra_capitao)
+
+        linhas_resultado.append({
+            "rodada": r,
+            "Você": float(linha_usuario.pontos),
+            "Modelo": _pontos_reais_do_time(melhor_modelo),
+            "Ideal da rodada": _pontos_reais_do_time(melhor_ideal),
+        })
+
+    return pd.DataFrame(linhas_resultado)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -552,21 +670,33 @@ with tab_meu:
         }
         escolha = st.selectbox("Selecione o seu time", list(opcoes.keys()), key="time_escolhido")
         time_sel = opcoes[escolha]
-        slug = time_sel.get("slug") or (time_sel.get("time", {}) or {}).get("slug")
+        time_id, slug = extrair_id_slug(time_sel)
 
-        if not slug:
-            st.error("Não encontrei o identificador (slug) desse time na resposta da API.")
+        if not time_id and not slug:
+            st.error("Não encontrei o identificador desse time na resposta da API.")
             with st.expander("Ver dados brutos recebidos (para depuração)"):
                 st.json(time_sel)
-        elif st.button("Carregar meu histórico de pontuação"):
-            with st.spinner("Buscando pontuação rodada a rodada..."):
-                hist_time = historico_meu_time(slug, rodada)
-            if hist_time.empty:
+        else:
+            if st.button("Carregar meu histórico de pontuação"):
+                with st.spinner("Buscando pontuação rodada a rodada..."):
+                    hist_time, diagnostico = historico_meu_time(time_id, slug, rodada)
+                st.session_state["hist_time"] = hist_time
+                st.session_state["hist_time_diag"] = diagnostico
+
+            hist_time = st.session_state.get("hist_time")
+            diagnostico = st.session_state.get("hist_time_diag")
+
+            if hist_time is not None and hist_time.empty:
                 st.warning(
                     "Não consegui ler a pontuação por rodada — talvez o formato da resposta "
-                    "tenha mudado. Me avise para eu ajustar."
+                    "tenha mudado nessa rota. Segue abaixo o que a API respondeu na primeira "
+                    "tentativa; me manda um print disso que eu ajusto rapidinho."
                 )
-            else:
+                if diagnostico:
+                    with st.expander("Ver diagnóstico técnico", expanded=True):
+                        st.json(diagnostico)
+
+            elif hist_time is not None:
                 media = hist_time.pontos.mean()
                 melhor = hist_time.loc[hist_time.pontos.idxmax()]
                 pior = hist_time.loc[hist_time.pontos.idxmin()]
@@ -584,4 +714,43 @@ with tab_meu:
                     }),
                     use_container_width=True, hide_index=True,
                 )
+
+                st.divider()
+                st.subheader("Comparação: Você vs. Modelo vs. Time ideal")
+                st.caption(
+                    "Para cada rodada, o modelo é retreinado usando só dados até a rodada "
+                    "anterior (sem cola) e aplicado nos resultados reais. O \"time ideal\" é "
+                    "o teto matemático — o melhor time possível sabendo o resultado depois, "
+                    "dado o mesmo orçamento que você tinha naquela rodada. Isso recalcula o "
+                    "modelo várias vezes, então pode levar um tempinho."
+                )
+                n_rodadas = st.slider("Quantas das últimas rodadas comparar", 3, 10, 5, key="n_rodadas_comp")
+                if st.button("Gerar comparação"):
+                    with st.spinner("Recalculando o modelo para cada rodada — pode levar 1-2 minutos..."):
+                        comp = comparativo_rodadas(hist_time, rodada, cartoletas, formacao, mult_cap, n_rodadas)
+                    st.session_state["comparativo"] = comp
+
+                comp = st.session_state.get("comparativo")
+                if comp is not None:
+                    if comp.empty:
+                        st.warning(
+                            "Não consegui montar a comparação para nenhuma dessas rodadas "
+                            "(pode faltar preço histórico ou dados suficientes). Tenta um "
+                            "número menor de rodadas ou rodadas mais recentes."
+                        )
+                    else:
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Sua média no período", f"{comp['Você'].mean():.1f} pts")
+                        if comp["Modelo"].notna().any():
+                            c2.metric("Média do modelo", f"{comp['Modelo'].mean():.1f} pts",
+                                      delta=f"{comp['Modelo'].mean() - comp['Você'].mean():+.1f}")
+                        if comp["Ideal da rodada"].notna().any():
+                            c3.metric("Média do time ideal", f"{comp['Ideal da rodada'].mean():.1f} pts")
+
+                        st.line_chart(comp.set_index("rodada")[["Você", "Modelo", "Ideal da rodada"]])
+                        st.dataframe(
+                            comp.rename(columns={"rodada": "Rodada"}),
+                            use_container_width=True, hide_index=True,
+                        )
+
 
