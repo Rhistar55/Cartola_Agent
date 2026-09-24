@@ -246,8 +246,7 @@ def cartao_jogador(row, largura=148):
     else:
         hist_html = '<div style="font-size:10px;color:#5a3c0a;margin-top:6px;">sem histórico ainda</div>'
 
-    st.markdown(
-        f"""
+    cartao_html = f"""
         <div style="
             width:{largura}px;margin:0 auto 6px auto;border-radius:14px;
             background:linear-gradient(160deg,#f7dd8f 0%,#e8b93f 42%,#b8790a 100%);
@@ -272,10 +271,11 @@ def cartao_jogador(row, largura=148):
             </div>
             {hist_html}
         </div>
-        """,
-        unsafe_allow_html=True,
-
-    )
+    """
+    # Achata tudo numa única linha: o Markdown do Streamlit interpreta HTML indentado
+    # em várias linhas como bloco de código, então isso evita esse problema.
+    cartao_html = " ".join(l.strip() for l in cartao_html.strip().splitlines() if l.strip())
+    st.markdown(cartao_html, unsafe_allow_html=True)
 
 
 # ============================== INTERFACE ==============================
