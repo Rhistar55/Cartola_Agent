@@ -182,17 +182,16 @@ def montar_base():
     atl["adversario_escudo"] = atl.adversario.map(escudos)
     atl["posicao"] = atl.posicao_id.map(POS)
 
+    ultimos_map = {}
     if not h.empty:
-        def _ultimos5(grupo):
-            recentes = grupo.sort_values("rodada").tail(5)
-            return [
+        h_sorted = h.sort_values("rodada")
+        for atleta_id, grupo in h_sorted.groupby("atleta_id"):
+            recentes = grupo.tail(5)
+            ultimos_map[int(atleta_id)] = [
                 {"rodada": int(r.rodada), "pontos": round(float(r.pontos), 1),
                  "adversario_abrev": clubes.get(int(r.adversario), "?")}
                 for r in recentes.itertuples()
             ]
-        ultimos_map = h.groupby("atleta_id").apply(_ultimos5).to_dict()
-    else:
-        ultimos_map = {}
     atl["hist_pontos"] = atl["atleta_id"].map(ultimos_map)
     atl["hist_pontos"] = atl["hist_pontos"].apply(lambda v: v if isinstance(v, list) else [])
     return atl, rodada, aberto, validacao, mando
@@ -205,6 +204,7 @@ def cartao_jogador(row, largura=148):
     escudo = row.get("clube_escudo")
     adv_escudo = row.get("adversario_escudo")
     hist = row.get("hist_pontos") or []
+    hist = [j for j in hist if isinstance(j, dict) and "pontos" in j]
 
     foto_html = (
         f'<img src="{foto}" style="width:64px;height:64px;border-radius:50%;object-fit:cover;'
