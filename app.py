@@ -8,7 +8,7 @@ Rodar localmente:
 Deploy gratuito: suba este arquivo + requirements.txt num repositório do
 GitHub e conecte em https://share.streamlit.io (Streamlit Community Cloud).
 """
-import json, os, time
+import json, os, time, unicodedata
 import numpy as np
 import pandas as pd
 import requests
@@ -45,7 +45,8 @@ SCOUT_GRUPOS = {
 }
 SCOUT_COLS = list(SCOUT_GRUPOS)
 FEATS_SCOUT = [f"{c}_media5" for c in SCOUT_COLS]
-FEATS = FEATS + FEATS_SCOUT
+FEATS_FORMA = ["time_forma5", "time_saldo5", "time_ppg_mando", "adv_forma5", "adv_saldo5", "adv_ppg_mando"]
+FEATS = FEATS + FEATS_SCOUT + FEATS_FORMA
 
 
 def _agregar_scout(scout):
@@ -84,6 +85,156 @@ def mandos(partidas):
         m[p["clube_casa_id"]] = (1, p["clube_visitante_id"])
         m[p["clube_visitante_id"]] = (0, p["clube_casa_id"])
     return m
+
+
+# Nomes de campo candidatos pro placar oficial — a API não documenta isso oficialmente,
+# então tentamos algumas variações conhecidas antes de desistir de uma partida.
+CAMPOS_PLACAR = [
+    ("placar_oficial_mandante", "placar_oficial_visitante"),
+    ("placar_mandante", "placar_visitante"),
+    ("gols_mandante", "gols_visitante"),
+]
+
+
+def _extrair_placar(p):
+    for campo_m, campo_v in CAMPOS_PLACAR:
+        if p.get(campo_m) is not None and p.get(campo_v) is not None:
+            return p[campo_m], p[campo_v]
+    return None, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resultados_clubes(rodada_atual):
+    """Resultado (V/E/D) e gols de cada clube, rodada a rodada — usado para calcular a forma recente."""
+    linhas = []
+    for r in range(1, rodada_atual):
+        try:
+            partidas = api_get(f"/partidas/{r}")
+        except Exception:
+            continue
+        for p in partidas.get("partidas", []):
+            if not p.get("valida", True):
+                continue
+            gm, gv = _extrair_placar(p)
+            if gm is None or gv is None:
+                continue
+            cm, cv = p["clube_casa_id"], p["clube_visitante_id"]
+            pm = 3 if gm > gv else (1 if gm == gv else 0)
+            pv = 3 if gv > gm else (1 if gm == gv else 0)
+            linhas.append(dict(rodada=r, clube_id=cm, mandante=1, gols_pro=gm, gols_contra=gv, pontos_jogo=pm))
+            linhas.append(dict(rodada=r, clube_id=cv, mandante=0, gols_pro=gv, gols_contra=gm, pontos_jogo=pv))
+    return pd.DataFrame(linhas)
+
+
+def form_clubes(resultados):
+    """Para cada clube/rodada: forma recente (últimos 5 jogos), saldo de gols recente e
+    aproveitamento médio (pontos por jogo) jogando em casa ou fora — tudo calculado só com
+    jogos ANTERIORES à rodada (sem vazamento de informação)."""
+    cols_saida = ["rodada", "clube_id", "forma5", "saldo5", "ppg_mando"]
+    if resultados.empty:
+        return pd.DataFrame(columns=cols_saida)
+    r = resultados.sort_values(["clube_id", "rodada"]).copy()
+    r["saldo_jogo"] = r["gols_pro"] - r["gols_contra"]
+    r["forma5"] = r.groupby("clube_id")["pontos_jogo"].transform(lambda s: s.shift().rolling(5, 1).mean())
+    r["saldo5"] = r.groupby("clube_id")["saldo_jogo"].transform(lambda s: s.shift().rolling(5, 1).mean())
+    r["ppg_mando"] = r.groupby(["clube_id", "mandante"])["pontos_jogo"].transform(
+        lambda s: s.shift().expanding().mean())
+    return r[cols_saida]
+
+
+# ---------------------------------------------------------------- odds (contexto, opcional)
+# Isso NÃO entra como feature treinada no modelo — só temos odds da rodada atual, não dá pra
+# reconstruir odds de rodadas passadas pra treinar/validar direito. Entra só como painel
+# informativo ao lado da escalação.
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_SPORT_KEY = "soccer_brazil_campeonato"
+
+
+def obter_chave_odds():
+    try:
+        return st.secrets.get("ODDS_API_KEY")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_odds_rodada(chave):
+    if not chave:
+        return None, "Chave da API de odds não configurada nos Secrets do Streamlit."
+    try:
+        r = requests.get(
+            f"{ODDS_API_BASE}/sports/{ODDS_SPORT_KEY}/odds",
+            params={"apiKey": chave, "regions": "eu,uk", "markets": "h2h", "oddsFormat": "decimal"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _normalizar_nome_time(nome):
+    n = unicodedata.normalize("NFKD", nome or "").encode("ascii", "ignore").decode().lower()
+    for lixo in (" fc", " ec", " sc", "-"):
+        n = n.replace(lixo, " ")
+    return " ".join(n.split())
+
+
+def _casar_time(nome_odds, nomes_cartola):
+    """Acha, entre os clubes do Cartola, qual bate com o nome usado pela API de odds."""
+    alvo = _normalizar_nome_time(nome_odds)
+    melhor, melhor_pontos = None, 0
+    for clube_id, nome_c in nomes_cartola.items():
+        n = _normalizar_nome_time(nome_c)
+        pontos = 100 if n == alvo else (50 + min(len(n), len(alvo)) if (n in alvo or alvo in n) else 0)
+        if pontos > melhor_pontos:
+            melhor, melhor_pontos = clube_id, pontos
+    return melhor if melhor_pontos >= 50 else None
+
+
+def odds_por_clube(chave, nomes_cartola):
+    """{clube_id: {'vitoria':P,'empate':P,'derrota':P}} pros jogos da rodada + times não identificados."""
+    dados, erro = buscar_odds_rodada(chave)
+    if erro or not dados:
+        return {}, [], erro
+    resultado, nao_casados = {}, []
+    for evento in dados:
+        home, away = evento.get("home_team"), evento.get("away_team")
+        somas = {"home": [], "draw": [], "away": []}
+        for bk in (evento.get("bookmakers") or []):
+            for mercado in bk.get("markets", []):
+                if mercado.get("key") != "h2h":
+                    continue
+                for outcome in mercado.get("outcomes", []):
+                    preco = outcome.get("price")
+                    if not preco:
+                        continue
+                    if outcome.get("name") == home:
+                        somas["home"].append(preco)
+                    elif outcome.get("name") == away:
+                        somas["away"].append(preco)
+                    else:
+                        somas["draw"].append(preco)
+        if not somas["home"] or not somas["away"]:
+            continue
+        probs_brutas = {"home": 1 / np.mean(somas["home"]), "away": 1 / np.mean(somas["away"])}
+        if somas["draw"]:
+            probs_brutas["draw"] = 1 / np.mean(somas["draw"])
+        soma = sum(probs_brutas.values())
+        probs = {k: v / soma for k, v in probs_brutas.items()}  # remove o overround da casa de apostas
+
+        id_home, id_away = _casar_time(home, nomes_cartola), _casar_time(away, nomes_cartola)
+        if id_home is None:
+            nao_casados.append(home)
+        if id_away is None:
+            nao_casados.append(away)
+        if id_home is not None:
+            resultado[id_home] = {"vitoria": probs["home"], "empate": probs.get("draw", 0),
+                                    "derrota": probs["away"]}
+        if id_away is not None:
+            resultado[id_away] = {"vitoria": probs["away"], "empate": probs.get("draw", 0),
+                                    "derrota": probs["home"]}
+    return resultado, nao_casados, None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -171,7 +322,7 @@ def historico_meu_time(time_id, slug, rodada_atual):
     return pd.DataFrame(linhas), diagnostico
 
 
-def features(h):
+def features(h, forma_tab=None):
     h = h.sort_values(["atleta_id", "rodada"]).copy()
     g = h.groupby("atleta_id")["pontos"]
     h["media_3"] = g.transform(lambda s: s.shift().rolling(3, 1).mean())
@@ -193,7 +344,22 @@ def features(h):
 
     fc = h.groupby(["clube_id", "rodada"])["pontos"].mean().reset_index().sort_values("rodada")
     fc["forca"] = fc.groupby("clube_id")["pontos"].transform(lambda s: s.shift().expanding().mean())
-    return h.merge(fc.drop(columns="pontos"), on=["clube_id", "rodada"], how="left")
+    h = h.merge(fc.drop(columns="pontos"), on=["clube_id", "rodada"], how="left")
+
+    if forma_tab is not None and not forma_tab.empty:
+        proprio = forma_tab.rename(columns={
+            "forma5": "time_forma5", "saldo5": "time_saldo5", "ppg_mando": "time_ppg_mando"})
+        h = h.merge(proprio[["clube_id", "rodada", "time_forma5", "time_saldo5", "time_ppg_mando"]],
+                    on=["clube_id", "rodada"], how="left")
+        adversario_tab = forma_tab.rename(columns={
+            "clube_id": "adversario", "forma5": "adv_forma5",
+            "saldo5": "adv_saldo5", "ppg_mando": "adv_ppg_mando"})
+        h = h.merge(adversario_tab[["adversario", "rodada", "adv_forma5", "adv_saldo5", "adv_ppg_mando"]],
+                    on=["adversario", "rodada"], how="left")
+    else:
+        for col in FEATS_FORMA:
+            h[col] = np.nan
+    return h
 
 
 def treinar(h):
@@ -292,9 +458,10 @@ def comparativo_rodadas(hist_time, rodada_atual, cartoletas_padrao, formacao_esc
             continue
 
         h_treino = historico(r)
+        forma_tab_r = form_clubes(resultados_clubes(r))
         alvo_rows = rodada_df[["atleta_id", "clube_id", "posicao_id", "casa", "adversario"]].assign(
             rodada=r, pontos=np.nan)
-        tudo_r = features(pd.concat([h_treino, alvo_rows], ignore_index=True))
+        tudo_r = features(pd.concat([h_treino, alvo_rows], ignore_index=True), forma_tab_r)
         alvo_feats = tudo_r[tudo_r.rodada == r].set_index("atleta_id")
         modelo_r, _ = treinar(tudo_r[tudo_r.rodada < r])
 
@@ -346,6 +513,7 @@ def montar_base():
     merc = api_get("/atletas/mercado", cache=False)
     clubes = {int(k): v["abreviacao"] for k, v in merc["clubes"].items()}
     escudos = {int(k): (v.get("escudos") or {}).get("60x60") for k, v in merc["clubes"].items()}
+    nomes_clubes = {int(k): v.get("nome", v["abreviacao"]) for k, v in merc["clubes"].items()}
     atl = pd.DataFrame(merc["atletas"])
     atl = atl[atl.status_id == PROVAVEL].copy()
     if "foto" in atl.columns:
@@ -359,9 +527,10 @@ def montar_base():
     atl["adversario"] = atl.clube_id.map(lambda c: mando[c][1])
 
     h = historico(rodada)
+    forma_tab = form_clubes(resultados_clubes(rodada))
     prox = atl[["atleta_id", "clube_id", "posicao_id", "casa", "adversario"]].assign(
         rodada=rodada, pontos=np.nan)
-    tudo = features(pd.concat([h, prox], ignore_index=True))
+    tudo = features(pd.concat([h, prox], ignore_index=True), forma_tab)
     alvo = tudo[tudo.rodada == rodada].set_index("atleta_id")
 
     modelo, validacao = treinar(tudo[tudo.rodada < rodada])
@@ -380,6 +549,7 @@ def montar_base():
     atl = atl.reset_index()
     atl["clube_abrev"] = atl.clube_id.map(clubes)
     atl["clube_escudo"] = atl.clube_id.map(escudos)
+    atl["clube_nome"] = atl.clube_id.map(nomes_clubes)
     atl["adversario_abrev"] = atl.adversario.map(clubes)
     atl["adversario_escudo"] = atl.adversario.map(escudos)
     atl["posicao"] = atl.posicao_id.map(POS)
@@ -552,6 +722,44 @@ tab_auto, tab_manual, tab_meu = st.tabs(
 
 # ============================== ABA 1 — AUTOMÁTICA ==============================
 with tab_auto:
+    with st.expander("📊 Contexto de mercado (odds) — opcional"):
+        chave_odds = obter_chave_odds()
+        if not chave_odds:
+            st.caption(
+                "Ainda não configurado. No painel do seu app no Streamlit Cloud, vá em "
+                "**Settings → Secrets** e cole (trocando pela sua chave real):"
+            )
+            st.code('ODDS_API_KEY = "sua-chave-aqui"', language="toml")
+            st.caption(
+                "Isso fica guardado separado do código-fonte, então não aparece no GitHub. "
+                "Esse contexto é só informativo — não entra no modelo treinado, porque só "
+                "temos odds da rodada atual, não do passado, pra validar direito."
+            )
+        else:
+            nomes_clubes_map = atl_disp.drop_duplicates("clube_id").set_index("clube_id")["clube_nome"].to_dict()
+            escudos_map = atl_disp.drop_duplicates("clube_id").set_index("clube_id")["clube_escudo"].to_dict()
+            probs_odds, nao_casados, erro_odds = odds_por_clube(chave_odds, nomes_clubes_map)
+            if erro_odds:
+                st.warning(f"Não consegui buscar as odds agora: {erro_odds}")
+            elif not probs_odds:
+                st.caption("Sem odds encontradas pra essa rodada no momento.")
+            else:
+                linhas_odds = [{
+                    "Time": escudos_map.get(cid), "Vitória": p["vitoria"] * 100,
+                    "Empate": p["empate"] * 100, "Derrota": p["derrota"] * 100,
+                } for cid, p in probs_odds.items()]
+                st.dataframe(
+                    pd.DataFrame(linhas_odds), use_container_width=True, hide_index=True,
+                    column_config={
+                        "Time": st.column_config.ImageColumn("Time", width="small"),
+                        "Vitória": st.column_config.ProgressColumn("Vitória", format="%.0f%%", min_value=0, max_value=100),
+                        "Empate": st.column_config.ProgressColumn("Empate", format="%.0f%%", min_value=0, max_value=100),
+                        "Derrota": st.column_config.ProgressColumn("Derrota", format="%.0f%%", min_value=0, max_value=100),
+                    },
+                )
+                if nao_casados:
+                    st.caption(f"Times que a odds trouxe mas eu não identifiquei: {', '.join(set(nao_casados))}")
+
     forms = list(FORMACOES) if formacao == "auto" else [formacao]
     melhor = None
     for f in forms:
